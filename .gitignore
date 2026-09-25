@@ -42,3 +42,15 @@ terraform.rc
 # Optional: ignore plan files saved before destroying Terraform configuration
 # Uncomment the line below if you want to ignore planout files.
 # planout
+# ===== EpicBook additions =====
+# Saved Terraform plans (can contain sensitive values)
+tfplan
+*.tfplan
+# Local backend settings file
+backend.hcl
+# SSH private keys - NEVER commit
+*.pem
+*.key
+epicbook-azure-key
+# Allow ONLY the non-sensitive variables file (passwords come from pipeline secrets)
+!terraform/terraform.tfvars
