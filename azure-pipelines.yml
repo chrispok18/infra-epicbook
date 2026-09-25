@@ -1,0 +1,143 @@
+# =============================================================================
+# EpicBook — INFRASTRUCTURE PIPELINE (Terraform)
+# Validate -> Plan (saved plan file) -> Manual approval -> Apply (same plan file)
+# Runs on the self-hosted agent (static IP, Terraform pre-installed).
+# Secrets: Azure SP comes from the service connection, MySQL password from the
+# secret variable group. Nothing sensitive is stored in this file.
+# =============================================================================
+
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - terraform/*
+      - azure-pipelines.yml
+
+pr: none
+
+pool:
+  name: SelfHostedPool
+
+variables:
+  - group: epicbook-mysql-secrets        # mysqlAdminUsername, mysqlAdminPassword (secret)
+  - name: azureServiceConnection
+    value: epicbook-azure-sc
+  - name: tfDir
+    value: $(System.DefaultWorkingDirectory)/terraform
+
+stages:
+
+  # ---------------------------------------------------------------------------
+  - stage: Validate
+    displayName: 'Terraform Validate'
+    jobs:
+      - job: validate
+        displayName: 'fmt + validate'
+        steps:
+          - checkout: self
+            clean: true
+
+          - script: |
+              set -e
+              terraform version
+              terraform fmt -check -recursive
+              terraform init -backend=false -input=false
+              terraform validate
+            workingDirectory: $(tfDir)
+            displayName: 'terraform fmt / init / validate'
+
+  # ---------------------------------------------------------------------------
+  - stage: Plan
+    displayName: 'Terraform Plan'
+    dependsOn: Validate
+    jobs:
+      - job: plan
+        displayName: 'Create saved plan'
+        steps:
+          - checkout: self
+            clean: true
+
+          - task: AzureCLI@2
+            displayName: 'terraform init + plan -out=tfplan'
+            inputs:
+              azureSubscription: epicbook-azure-sc
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(tfDir)
+              inlineScript: |
+                set -e
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_CLIENT_SECRET="$servicePrincipalKey"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                terraform init -input=false
+                terraform plan -input=false -out=tfplan
+            env:
+              TF_VAR_mysql_admin_username: $(mysqlAdminUsername)
+              TF_VAR_mysql_admin_password: $(mysqlAdminPassword)
+
+          # The reviewed plan is passed to Apply as a PRIVATE pipeline artifact
+          # (visible only inside the private Azure DevOps project).
+          - publish: $(tfDir)/tfplan
+            artifact: tfplan
+            displayName: 'Publish saved plan for Apply'
+
+  # ---------------------------------------------------------------------------
+  - stage: Approve
+    displayName: 'Manual Approval'
+    dependsOn: Plan
+    jobs:
+      - job: waitForApproval
+        displayName: 'Review the plan, then approve'
+        pool: server
+        timeoutInMinutes: 70
+        steps:
+          - task: ManualValidation@0
+            timeoutInMinutes: 60
+            inputs:
+              notifyUsers: 'krisbillion18@outlook.com'
+              instructions: 'Review the Terraform plan in the Plan stage log. Approve to apply exactly that plan.'
+              onTimeout: 'reject'
+
+  # ---------------------------------------------------------------------------
+  - stage: Apply
+    displayName: 'Terraform Apply'
+    dependsOn: Approve
+    jobs:
+      - job: apply
+        displayName: 'Apply the approved plan'
+        steps:
+          - checkout: self
+            clean: true
+
+          - download: current
+            artifact: tfplan
+            displayName: 'Download the approved plan'
+
+          - task: AzureCLI@2
+            displayName: 'terraform apply tfplan + show outputs'
+            inputs:
+              azureSubscription: epicbook-azure-sc
+              scriptType: bash
+              scriptLocation: inlineScript
+              addSpnToEnvironment: true
+              workingDirectory: $(tfDir)
+              inlineScript: |
+                set -e
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_CLIENT_SECRET="$servicePrincipalKey"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                cp "$(Pipeline.Workspace)/tfplan/tfplan" ./tfplan
+                terraform init -input=false
+                terraform apply -input=false tfplan
+                rm -f tfplan
+                echo "================ NON-SENSITIVE OUTPUTS ================"
+                echo "app_public_ip        = $(terraform output -raw app_public_ip)"
+                echo "backend_ansible_host = $(terraform output -raw backend_ansible_host)"
+                echo "backend_private_ip   = $(terraform output -raw backend_private_ip)"
+                echo "mysql_fqdn           = $(terraform output -raw mysql_fqdn)"
+                echo "======================================================="
